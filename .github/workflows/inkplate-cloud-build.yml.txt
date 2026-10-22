@@ -1,0 +1,74 @@
+name: Build Inkplate 6 MOTION demo
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  firmware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out official Inkplate Motion library
+        uses: actions/checkout@v4
+
+      - name: Install Arduino CLI on hosted x86-64 Linux
+        uses: arduino/setup-arduino-cli@v2
+        with:
+          version: 1.5.1
+
+      - name: Install official Soldered board and tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          BOARD_URL=https://github.com/SolderedElectronics/Dasduino-Board-Definitions-for-Arduino-IDE/raw/master/package_Dasduino_Boards_index.json
+          arduino-cli core update-index --additional-urls "$BOARD_URL"
+          arduino-cli core install Inkplate_Motion:stm32@1.0.2 --additional-urls "$BOARD_URL"
+
+      - name: Correct Soldered prebuild shell portability bug
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          script = Path.home()/'.arduino15/packages/Inkplate_Motion/hardware/stm32/1.0.2/system/extras/prebuild.sh'
+          source = script.read_text()
+          patched, count = re.subn(r'\$\{BOARD_PLATFORM_PATH//[^}]*\}', '${BOARD_PLATFORM_PATH}', source)
+          if count != 2:
+              raise SystemExit(f'Unexpected Soldered prebuild script: expected 2 Bash substitutions; found {count}')
+          script.write_text(patched)
+          print('Patched 2 nonportable substitutions.')
+          PY
+
+      - name: Install library from checked-out official repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/Arduino/libraries"
+          ln -s "$GITHUB_WORKSPACE" "$HOME/Arduino/libraries/InkplateMotion"
+
+      - name: Compile official Simple B&W display example
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/firmware"
+          arduino-cli compile \
+            --fqbn Inkplate_Motion:stm32:Inkplate6Motion \
+            --output-dir "$GITHUB_WORKSPACE/firmware" \
+            "$GITHUB_WORKSPACE/examples/Inkplate6Motion/Basic/Inkplate_6_Motion_Simple_BW"
+          find "$GITHUB_WORKSPACE/firmware" -maxdepth 1 -type f -printf '%f %s bytes\n'
+          find "$GITHUB_WORKSPACE/firmware" -maxdepth 1 -name '*.bin' | grep -q . || {
+            echo 'ERROR: No .bin firmware was generated'
+            exit 1
+          }
+
+      - name: Save firmware binary for download
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkplate-6-motion-bw-firmware
+          path: firmware/*.bin
+          if-no-files-found: error
+          retention-days: 14
