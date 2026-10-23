@@ -1,229 +1,257 @@
-/**
- **************************************************
+/*
+ * FieldOS 1 — Inkplate 6 MOTION / Scuderia prototype
+ * 1024 x 758, high contrast B&W; no Wi-Fi, LEDs, or battery required.
  *
- * @file        Inkplate_6_Motion_Simple_BW.ino
- * @brief       How to draw basic graphics and text in black and white (1 bit mode)
+ * USER1  = next page
+ * USER2  = previous page
+ * WAKE   = Home
  *
- * For info on how to quickly get started with Inkplate 6MOTION visit docs.inkplate.com
+ * Optional Pi telemetry: 115200 baud, KEY=VALUE\n, e.g.
+ *   HOST=ZYNTHIAN
+ *   CPU=51C
+ *   LOAD=0.34
+ *   VOLT=12.6V
+ *   FRIDGE=4.2C
+ *   AMBIENT=22C
+ *   RMS=0.24
+ *   CREST=3.1
+ *   NOTE=BUILD SOMETHING GOOD
+ *   PAGE=HOME|SIENNA|LAB|QUIET
+ * Unknown/missing readings are shown as NO DATA.
  *
- * @authors     Borna Biro and Robert Soric for soldered.com
- * @date        January 2025
- ***************************************************/
+ * This file intentionally has the same name as Soldered's Simple_BW
+ * example so the existing cloud workflow compiles it unchanged.
+ */
 
-// Include Inkplate Motion Arduino Library.
 #include <InkplateMotion.h>
+#include <string.h>
 
-Inkplate inkplate; // Create Inkplate object
+Inkplate inkplate;
 
-// Delay in milliseconds between different drawing examples
-#define DELAY_MS 5000
+static const int SW = 1024;
+static const int SH = 758;
+static const uint32_t FEED_REFRESH_MS = 15000UL;
+static const uint32_t IDLE_REFRESH_MS = 120000UL;
+static const uint32_t FEED_STALE_MS = 180000UL;
+
+static uint8_t page = 0;
+static uint8_t lastButtons[3] = {HIGH, HIGH, HIGH};
+static uint32_t lastButtonAt = 0;
+static uint32_t lastDrawAt = 0;
+static uint32_t lastFeedAt = 0;
+static bool haveFeed = false;
+static bool dirty = false;
+static bool pageChanged = false;
+
+static char serialLine[96];
+static uint8_t serialLen = 0;
+
+static char host[22] = "NO DATA";
+static char cpu[18] = "NO DATA";
+static char loadAvg[18] = "NO DATA";
+static char voltage[18] = "NO DATA";
+static char fridge[18] = "NO DATA";
+static char ambient[18] = "NO DATA";
+static char rms[18] = "NO DATA";
+static char crest[18] = "NO DATA";
+static char note[42] = "Waiting for your first field note";
+
+static const char *pageNames[4] = {"HOME", "SIENNA", "LAB", "QUIET"};
+
+static void textAt(int x, int y, uint8_t size, const char *s, uint16_t color = BLACK)
+{
+    inkplate.setTextColor(color);
+    inkplate.setTextSize(size);
+    inkplate.setTextWrap(false);
+    inkplate.setCursor(x, y);
+    inkplate.print(s);
+}
+
+static void copyValue(char *dest, size_t capacity, const char *src)
+{
+    if (!capacity) return;
+    strncpy(dest, src, capacity - 1);
+    dest[capacity - 1] = '\0';
+}
+
+static void drawHeader(const char *title, const char *subtitle)
+{
+    inkplate.fillRect(0, 0, SW, 125, BLACK);
+    textAt(30, 23, 6, "FIELDOS", WHITE);
+    textAt(33, 88, 2, "SCUDERIA  /  INKPLATE MOTION", WHITE);
+    textAt(775, 29, 4, title, WHITE);
+    textAt(774, 88, 2, subtitle, WHITE);
+}
+
+static void drawFooter()
+{
+    inkplate.drawFastHLine(30, 709, 964, BLACK);
+    char p[38];
+    snprintf(p, sizeof(p), "PAGE %u / 4", unsigned(page + 1));
+    textAt(31, 726, 2, p);
+    textAt(245, 726, 2, "USER1 NEXT    USER2 BACK    WAKE HOME");
+}
+
+static void drawCard(int x, int y, int w, int h, const char *label,
+                     const char *value, const char *description)
+{
+    inkplate.drawRect(x, y, w, h, BLACK);
+    inkplate.fillRect(x, y, w, 49, BLACK);
+    textAt(x + 16, y + 12, 3, label, WHITE);
+    // Value sizes are deliberately restricted to avoid clipping.
+    size_t n = strlen(value);
+    uint8_t valueSize = n > 18 ? 2 : (n > 13 ? 3 : (n > 9 ? 4 : 5));
+    textAt(x + 18, y + 75, valueSize, value);
+    textAt(x + 18, y + h - 35, 2, description);
+}
+
+static void drawHome()
+{
+    drawHeader("HOME", "OVERVIEW");
+    drawCard(28, 152, 471, 247, "PI / LINK", host,
+             haveFeed && (millis() - lastFeedAt < FEED_STALE_MS) ? "SERIAL FEED ACTIVE" : "AWAITING PI TELEMETRY");
+    drawCard(525, 152, 471, 247, "PI / CPU TEMP", cpu, "ZYNTHIAN HOST");
+    drawCard(28, 418, 471, 247, "SIENNA / VOLTS", voltage, "FIELD BUS INPUT");
+    drawCard(525, 418, 471, 247, "FIELD / FRIDGE", fridge, "TEMPERATURE INPUT");
+}
+
+static void drawSienna()
+{
+    drawHeader("SIENNA", "FIELD BUS");
+    drawCard(28, 152, 471, 247, "BATTERY", voltage, "SOURCE: SERIAL / VOLT");
+    drawCard(525, 152, 471, 247, "FRIDGE", fridge, "SOURCE: SERIAL / FRIDGE");
+    drawCard(28, 418, 471, 247, "AMBIENT", ambient, "SOURCE: SERIAL / AMBIENT");
+    drawCard(525, 418, 471, 247, "RELAY BANK", "NOT LINKED", "NO OUTPUTS SWITCHED");
+}
+
+static void drawLab()
+{
+    drawHeader("LAB", "EDGE / AUDIO");
+    drawCard(28, 152, 471, 247, "EDGERAVE / RMS", rms, "VIBRATION MONITOR INPUT");
+    drawCard(525, 152, 471, 247, "EDGERAVE / CREST", crest, "FAULT ANALYSIS INPUT");
+    drawCard(28, 418, 471, 247, "PI / LOAD", loadAvg, "COMPUTE LOAD / 1 MIN");
+    drawCard(525, 418, 471, 247, "MIDI / ARRANGER", "STANDBY", "AUDIO SYSTEM UNTOUCHED");
+}
+
+static void drawQuiet()
+{
+    drawHeader("QUIET", "SANCTUARY");
+    inkplate.drawRect(28, 154, 968, 509, BLACK);
+    textAt(65, 200, 3, "TODAY'S PERMISSION");
+    inkplate.drawFastHLine(65, 259, 888, BLACK);
+    textAt(65, 302, 4, "I am allowed to have");
+    textAt(65, 360, 4, "a nice, simple house.");
+    textAt(65, 470, 3, "Small things. Beautifully done.");
+    textAt(65, 595, 2, "FIELD NOTE:");
+    textAt(250, 595, 2, note);
+}
+
+static void drawScreen()
+{
+    inkplate.clearDisplay();
+    switch (page) {
+        case 0: drawHome(); break;
+        case 1: drawSienna(); break;
+        case 2: drawLab(); break;
+        default: drawQuiet(); break;
+    }
+    drawFooter();
+    // Full updates deliberately limited: slow and steady, no LED animation.
+    inkplate.display();
+    lastDrawAt = millis();
+    dirty = false;
+    pageChanged = false;
+}
+
+static void handleLine(char *line)
+{
+    char *eq = strchr(line, '=');
+    if (!eq) return;
+    *eq++ = '\0';
+    if (strcmp(line, "PAGE") == 0) {
+        const char *p = eq;
+        for (uint8_t i = 0; i < 4; ++i) {
+            if (strcmp(p, pageNames[i]) == 0) {
+                page = i;
+                pageChanged = true;
+                return;
+            }
+        }
+        return;
+    }
+    char *dest = NULL;
+    size_t cap = 0;
+#define FIELD(k, v) if (strcmp(line, k) == 0) { dest = v; cap = sizeof(v); }
+    FIELD("HOST", host)
+    else FIELD("CPU", cpu)
+    else FIELD("LOAD", loadAvg)
+    else FIELD("VOLT", voltage)
+    else FIELD("FRIDGE", fridge)
+    else FIELD("AMBIENT", ambient)
+    else FIELD("RMS", rms)
+    else FIELD("CREST", crest)
+    else FIELD("NOTE", note)
+#undef FIELD
+    if (dest) {
+        copyValue(dest, cap, eq);
+        haveFeed = true;
+        lastFeedAt = millis();
+        dirty = true;
+    }
+}
+
+static void pollSerial()
+{
+    while (Serial.available() > 0) {
+        char c = char(Serial.read());
+        if (c == '\r') continue;
+        if (c == '\n') {
+            serialLine[serialLen] = '\0';
+            handleLine(serialLine);
+            serialLen = 0;
+        } else if (c >= 32 && c <= 126) {
+            if (serialLen < sizeof(serialLine) - 1) {
+                serialLine[serialLen++] = c;
+            } else {
+                serialLen = 0; // discard an oversized line
+            }
+        }
+    }
+}
+
+static void pollButtons()
+{
+    const int pins[3] = {INKPLATE_USER1, INKPLATE_USER2, INKPLATE_WAKE};
+    if (millis() - lastButtonAt < 160UL) return;
+    for (uint8_t i = 0; i < 3; ++i) {
+        uint8_t now = digitalRead(pins[i]);
+        if (now == LOW && lastButtons[i] == HIGH) {
+            if (i == 0) page = (page + 1) % 4;
+            if (i == 1) page = (page + 3) % 4;
+            if (i == 2) page = 0;
+            pageChanged = true;
+            lastButtonAt = millis();
+        }
+        lastButtons[i] = now;
+    }
+}
 
 void setup()
 {
-    inkplate.begin(INKPLATE_BLACKWHITE); // Initialize Inkplate in black-and-white mode
-    inkplate.clearDisplay();             // Clear any data that may have been in (software) frame buffer.
-    inkplate.display();                  // Update the display, important!
-    // The display function is required to change the contents of the display!
-
-    // Print welcome message and display it
-    inkplate.setCursor(150, 400);
-    inkplate.setTextSize(4);
-    inkplate.print("Welcome to Inkplate 6MOTION!");
-    inkplate.display();
-
-    delay(DELAY_MS);
+    Serial.begin(115200);
+    inkplate.begin(INKPLATE_BLACKWHITE);
+    pinMode(INKPLATE_USER1, INPUT_PULLUP);
+    pinMode(INKPLATE_USER2, INPUT_PULLUP);
+    pinMode(INKPLATE_WAKE, INPUT_PULLUP);
+    drawScreen();
 }
 
 void loop()
 {
-    // Drawing a single pixel
-    inkplate.clearDisplay();
-    displayCurrentAction("Drawing a pixel");
-    inkplate.drawPixel(100, 50, BLACK);
-    inkplate.display();
-    delay(DELAY_MS);
-
-    // Drawing random pixels
-    inkplate.clearDisplay();
-    for (int i = 0; i < 600; i++)
-    {
-        inkplate.drawPixel(random(0, 1023), random(0, 757), BLACK);
-    }
-    displayCurrentAction("Drawing 600 random pixels");
-    inkplate.display();
-    delay(DELAY_MS);
-
-    // Draw diagonal lines
-    inkplate.clearDisplay();
-    inkplate.drawLine(0, 0, 1023, 757, BLACK);
-    inkplate.drawLine(1023, 0, 0, 757, BLACK);
-    displayCurrentAction("Drawing two diagonal lines");
-    inkplate.display();
-    delay(DELAY_MS);
-
-    // Draw random lines
-    inkplate.clearDisplay();
-    for (int i = 0; i < 50; i++)
-    {
-        inkplate.drawLine(random(0, 1023), random(0, 757), random(0, 1023), random(0, 757), BLACK);
-    }
-    displayCurrentAction("Drawing 50 random lines");
-    inkplate.display();
-    delay(DELAY_MS);
-
-    // Drawing a grid
-    inkplate.clearDisplay();
-    for (int i = 0; i < 1024; i += 8)
-    {
-        inkplate.drawFastVLine(i, 0, 758, BLACK);
-    }
-    for (int i = 0; i < 758; i += 4)
-    {
-        inkplate.drawFastHLine(0, i, 1024, BLACK);
-    }
-    displayCurrentAction("Drawing a grid using horizontal and vertical lines");
-    inkplate.display();
-    delay(DELAY_MS);
-
-    // Draw rectangle
-    inkplate.clearDisplay();
-    inkplate.drawRect(300, 300, 400, 300, BLACK);
-    displayCurrentAction("Drawing rectangle");
-    inkplate.display();
-    delay(DELAY_MS);
-
-    // Draw random rectangles
-    inkplate.clearDisplay();
-    for (int i = 0; i < 50; i++)
-    {
-        inkplate.drawRect(random(0, 1023), random(0, 757), 100, 150, BLACK);
-    }
-    displayCurrentAction("Drawing many rectangles");
-    inkplate.display();
-    delay(DELAY_MS);
-
-    // Draw filled rectangle
-    inkplate.clearDisplay();
-    inkplate.fillRect(300, 300, 400, 300, BLACK);
-    displayCurrentAction("Drawing filled rectangle");
-    inkplate.display();
-    delay(DELAY_MS);
-
-    // Draw random filled rectangles
-    inkplate.clearDisplay();
-    for (int i = 0; i < 50; i++)
-    {
-        inkplate.fillRect(random(0, 1023), random(0, 757), 30, 30, BLACK);
-    }
-    displayCurrentAction("Drawing many filled rectangles");
-    inkplate.display();
-    delay(DELAY_MS);
-
-    // Draw circle
-    inkplate.clearDisplay();
-    inkplate.drawCircle(512, 379, 75, BLACK);
-    displayCurrentAction("Drawing a circle");
-    inkplate.display();
-    delay(DELAY_MS);
-
-    // Draw random circles
-    inkplate.clearDisplay();
-    for (int i = 0; i < 40; i++)
-    {
-        inkplate.drawCircle(random(0, 1023), random(0, 757), 25, BLACK);
-    }
-    displayCurrentAction("Drawing many circles");
-    inkplate.display();
-    delay(DELAY_MS);
-
-    // Draw filled circle
-    inkplate.clearDisplay();
-    inkplate.fillCircle(512, 379, 75, BLACK);
-    displayCurrentAction("Drawing filled circle");
-    inkplate.display();
-    delay(DELAY_MS);
-
-    // Draw random filled circles
-    inkplate.clearDisplay();
-    for (int i = 0; i < 40; i++)
-    {
-        inkplate.fillCircle(random(0, 1023), random(0, 757), 15, BLACK);
-    }
-    displayCurrentAction("Drawing many filled circles");
-    inkplate.display();
-    delay(DELAY_MS);
-
-    // Draw rounded rectangle
-    inkplate.clearDisplay();
-    inkplate.drawRoundRect(300, 300, 400, 300, 10, BLACK);
-    displayCurrentAction("Drawing rounded rectangle");
-    inkplate.display();
-    delay(DELAY_MS);
-
-    // Draw random rounded rectangles
-    inkplate.clearDisplay();
-    for (int i = 0; i < 50; i++)
-    {
-        inkplate.drawRoundRect(random(0, 1023), random(0, 757), 100, 150, 5, BLACK);
-    }
-    displayCurrentAction("Drawing many rounded rectangles");
-    inkplate.display();
-    delay(DELAY_MS);
-
-    // Draw filled rounded rectangle
-    inkplate.clearDisplay();
-    inkplate.fillRoundRect(300, 300, 400, 300, 10, BLACK);
-    displayCurrentAction("Drawing filled rounded rectangle");
-    inkplate.display();
-    delay(DELAY_MS);
-
-    // Draw random filled rounded rectangles
-    inkplate.clearDisplay();
-    for (int i = 0; i < 50; i++)
-    {
-        inkplate.fillRoundRect(random(0, 1023), random(0, 757), 30, 30, 3, BLACK);
-    }
-    displayCurrentAction("Drawing many filled rounded rectangles");
-    inkplate.display();
-    delay(DELAY_MS);
-
-    // Draw triangle
-    inkplate.clearDisplay();
-    inkplate.drawTriangle(300, 500, 700, 500, 512, 200, BLACK);
-    displayCurrentAction("Drawing triangle");
-    inkplate.display();
-    delay(DELAY_MS);
-
-    // Draw filled triangle
-    inkplate.fillTriangle(350, 467, 650, 467, 512, 250, BLACK);
-    displayCurrentAction("Drawing filled triangle");
-    inkplate.display();
-    delay(DELAY_MS);
-
-    // Draw text with display rotation
-    int r = 0;
-    inkplate.setTextSize(5);
-    inkplate.setTextColor(WHITE, BLACK);
-    while (true)
-    {
-        inkplate.setCursor(100, 100);
-        inkplate.clearDisplay();
-        inkplate.setRotation(r);
-        inkplate.print("INKPLATE 6MOTION");
-        inkplate.display();
-        r++;
-        delay(DELAY_MS);
-    }
-}
-
-// Function to indicate current action on display
-void displayCurrentAction(String text)
-{
-    // Set text color to black, set the size and cursor position
-    inkplate.setTextColor(BLACK);
-    inkplate.setTextSize(2);
-    inkplate.setCursor(2, 740);
-    // Draw white background before printing
-    inkplate.fillRect(0, 740, 1024, 18, WHITE);
-    inkplate.print(text); // Print the text
+    pollButtons();
+    pollSerial();
+    const uint32_t elapsed = millis() - lastDrawAt;
+    if (pageChanged || (dirty && elapsed >= FEED_REFRESH_MS) || elapsed >= IDLE_REFRESH_MS)
+        drawScreen();
+    delay(15);
 }
