@@ -1,0 +1,106 @@
+name: Build Atlas Book
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  firmware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out Atlas source
+        uses: actions/checkout@v4
+
+      - name: Validate single Atlas sketch
+        shell: bash
+        run: |
+          set -euo pipefail
+          SKETCH="$GITHUB_WORKSPACE/examples/Inkplate6Motion/Basic/Inkplate_6_Motion_Simple_BW"
+          mapfile -t sketches < <(find "$SKETCH" -maxdepth 1 -type f -name '*.ino' | sort)
+          printf 'Sketch files:\n%s\n' "${sketches[@]}"
+          if (( ${#sketches[@]} != 1 )) || [[ "${sketches[0]:-}" != "$SKETCH/Inkplate_6_Motion_Simple_BW.ino" ]]; then
+            echo '::error::Atlas folder must contain exactly one .ino named Inkplate_6_Motion_Simple_BW.ino'
+            exit 1
+          fi
+
+      - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+        with:
+          version: 1.5.1
+
+      - name: Install official Soldered board and tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          BOARD_URL=https://github.com/SolderedElectronics/Dasduino-Board-Definitions-for-Arduino-IDE/raw/master/package_Dasduino_Boards_index.json
+          arduino-cli core update-index --additional-urls "$BOARD_URL"
+          arduino-cli core install Inkplate_Motion:stm32@1.0.2 --additional-urls "$BOARD_URL"
+
+      - name: Correct Soldered prebuild shell portability bug
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          script = Path.home()/'.arduino15/packages/Inkplate_Motion/hardware/stm32/1.0.2/system/extras/prebuild.sh'
+          source = script.read_text()
+          patched, count = re.subn(r'\$\{BOARD_PLATFORM_PATH//[^}]*\}', '${BOARD_PLATFORM_PATH}', source)
+          if count != 2:
+              raise SystemExit(f'Unexpected Soldered prebuild script: expected 2 Bash substitutions; found {count}')
+          script.write_text(patched)
+          print('Patched 2 nonportable substitutions.')
+          PY
+
+      - name: Install library from checked-out repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/Arduino/libraries"
+          ln -s "$GITHUB_WORKSPACE" "$HOME/Arduino/libraries/InkplateMotion"
+
+      - name: Compile Atlas firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/firmware"
+          LOG="$RUNNER_TEMP/atlas-build.log"
+          if ! arduino-cli compile \
+            --fqbn Inkplate_Motion:stm32:Inkplate6Motion \
+            --output-dir "$GITHUB_WORKSPACE/firmware" \
+            "$GITHUB_WORKSPACE/examples/Inkplate6Motion/Basic/Inkplate_6_Motion_Simple_BW" >"$LOG" 2>&1; then
+            echo '::group::Compiler output'
+            tail -n 100 "$LOG"
+            echo '::endgroup::'
+            echo '### Atlas build failed' >> "$GITHUB_STEP_SUMMARY"
+            echo 'First compiler errors:' >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            grep -m 12 -E '(^|[[:space:]])(fatal )?error:|Error during build:' "$LOG" >> "$GITHUB_STEP_SUMMARY" || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          tail -n 15 "$LOG"
+          find "$GITHUB_WORKSPACE/firmware" -maxdepth 1 -type f -printf '%f %s bytes\n'
+          test -f "$GITHUB_WORKSPACE/firmware/Inkplate_6_Motion_Simple_BW.ino.bin"
+
+      - name: Package Atlas firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp firmware/Inkplate_6_Motion_Simple_BW.ino.bin dist/atlas-v2.bin
+          sha256sum dist/atlas-v2.bin > dist/atlas-v2.bin.sha256
+          printf 'Atlas Book v2 | commit %s | run %s\n' "$GITHUB_SHA" "$GITHUB_RUN_NUMBER" > dist/BUILD.txt
+          echo "### Atlas firmware ready" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Download **atlas-firmware-v2** from the run artifacts.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save Atlas firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-firmware-v2
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 90
